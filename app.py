@@ -141,7 +141,10 @@ class AISApp(tk.Tk):
         """Load the searcher (pretrained model). No checkpoint needed."""
         try:
             self._set_status("Loading model...")
-            self._searcher = ArtifactSearcher(index_dir=config.CHECKPOINT_DIR)
+            self._searcher = ArtifactSearcher(
+                embedding_dim=config.EMBEDDING_DIM,
+                index_dir=config.CHECKPOINT_DIR,
+            )
             if self._searcher.index_ready:
                 n = len(self._searcher.image_paths)
                 self._set_status(f"Ready — {n} artifacts in reference database.")
@@ -193,12 +196,12 @@ class AISApp(tk.Tk):
             threading.Thread(target=self._run_search, daemon=True).start()
 
     def _first_run_then_search(self) -> None:
-        """Scrape reference images, build index, then search. Runs once."""
+        """Scrape → train → index → search. Runs once on first Analyze."""
         try:
             data_dir = Path(config.DATA_DIR)
 
             # ── Step 1: scrape ────────────────────────────────────────────────
-            self._set_status("First run: downloading reference images (this takes ~30 seconds)...")
+            self._set_status("First run: downloading reference images (~2 min)...")
             scrape_dataset(
                 classes=config.QUICK_CLASSES,
                 out_dir=data_dir,
@@ -207,12 +210,22 @@ class AISApp(tk.Tk):
                 on_progress=self._set_status,
             )
 
-            # ── Step 2: index ─────────────────────────────────────────────────
+            # ── Step 2: train domain adaptation layers ────────────────────────
+            self._set_status("Training your personal artifact model...")
+            self._searcher.train(
+                data_dir=data_dir,
+                epochs=config.EPOCHS,
+                batch_size=config.BATCH_SIZE,
+                lr=config.LEARNING_RATE,
+                on_progress=self._set_status,
+            )
+
+            # ── Step 3: index ─────────────────────────────────────────────────
             self._set_status("Building search index...")
             n = self._searcher.build_index(data_dir, on_progress=self._set_status)
             self._set_status(f"Index built — {n} reference artifacts.")
 
-            # ── Step 3: search ────────────────────────────────────────────────
+            # ── Step 4: search ────────────────────────────────────────────────
             self._run_search()
 
         except Exception as exc:
@@ -244,8 +257,11 @@ class AISApp(tk.Tk):
             tk.Label(self._results_frame, text="No results found.").pack()
             return
 
-        top_class = results[0]["predicted"]
-        self._prediction_var.set(f"Most likely: {top_class.replace('_', ' ').title()}")
+        top_class  = results[0]["predicted"]
+        confidence = results[0]["confidence"]
+        self._prediction_var.set(
+            f"Most likely: {top_class.replace('_', ' ').title()}    ({confidence})"
+        )
         self._prediction_label.pack(fill="x", pady=(0, 6))
 
         grid = tk.Frame(self._results_frame)
