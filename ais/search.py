@@ -273,37 +273,58 @@ class ArtifactSearcher:
 
     # ── Search ────────────────────────────────────────────────────────────────
 
-    def search(self, image: Image.Image, top_k: int = 6) -> list[dict]:
+    def search(
+        self,
+        image: Image.Image,
+        text: str = "",
+        top_k: int = 6,
+    ) -> tuple[list[dict], torch.Tensor]:
         """
-        Two-stage retrieval:
-          1. Fast cosine search → top-_RERANK_POOL candidates
-          2. Re-rank by TTA embedding similarity → return top_k
+        Two-stage multimodal retrieval (image + optional text description).
 
-        Returns list of dicts: {path, class, score, predicted, confidence}
+        Stage 1: fast cosine search → top-_RERANK_POOL candidates
+        Stage 2: apply text keyword boost to class weights → return top_k
+
+        Parameters
+        ----------
+        image : PIL image to search
+        text  : optional archaeologist description (e.g. "bronze coin with figure")
+        top_k : number of results to return
+
+        Returns
+        -------
+        results : list of dicts {path, class, score, predicted, confidence}
+        query_embedding : [1, D] tensor (for storing as feedback)
         """
         if not self.index_ready:
             raise RuntimeError("Index not built yet.")
 
-        # Stage 1 — fast retrieval against full index
-        z = self._embed(image)                                # [1, D]
-        sims = (self.embeddings @ z.T).squeeze(1)            # [N] — dot = cosine (pre-normalised)
+        from ais.research import text_class_boost
+
+        # Stage 1 — visual retrieval
+        z = self._embed(image)                               # [1, D]
+        sims = (self.embeddings @ z.T).squeeze(1)            # [N]
 
         pool_k = min(_RERANK_POOL, len(sims))
         pool_scores, pool_indices = sims.topk(pool_k)
 
-        # Stage 2 — take top_k from pool (embeddings already high quality via TTA)
         top_k   = min(top_k, pool_k)
         scores  = pool_scores[:top_k]
         indices = pool_indices[:top_k]
 
-        # Softmax-weighted class prediction
+        # Stage 2 — softmax-weighted class vote + text boost
         weights = torch.softmax(scores * (1.0 / _TTA_TEMP), dim=0)
+        unique_classes = list(set(self.class_names))
+        boosts = text_class_boost(text, unique_classes) if text.strip() else {}
+
         class_weights: dict[str, float] = defaultdict(float)
         for w, idx in zip(weights.tolist(), indices.tolist()):
-            class_weights[self.class_names[idx]] += w
+            cls = self.class_names[idx]
+            boost = boosts.get(cls, 1.0)
+            class_weights[cls] += w * boost
+
         predicted = max(class_weights, key=class_weights.get)
 
-        # Confidence label
         top_score = scores[0].item()
         if top_score >= 0.80:
             confidence = "High confidence"
@@ -312,7 +333,7 @@ class ArtifactSearcher:
         else:
             confidence = "Low confidence"
 
-        return [
+        results = [
             {
                 "path":       self.image_paths[idx],
                 "class":      self.class_names[idx],
@@ -322,3 +343,4 @@ class ArtifactSearcher:
             }
             for score, idx in zip(scores.tolist(), indices.tolist())
         ]
+        return results, z
