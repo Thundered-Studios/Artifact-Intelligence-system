@@ -251,7 +251,19 @@ class ArtifactSearcher:
 
     def _load_index(self) -> None:
         data = torch.load(self.index_path, map_location="cpu")
-        self.embeddings  = data["embeddings"]
+        emb  = data["embeddings"]
+
+        # Expected dim: 768 (raw DINOv2 CLS) or embedding_dim (trained model)
+        expected_dim = self.embedding_dim if self._trained else 768
+        if emb.shape[1] != expected_dim:
+            logger.warning(
+                "Stale index (dim %d) does not match current model (dim %d) — clearing.",
+                emb.shape[1], expected_dim,
+            )
+            self.index_path.unlink(missing_ok=True)
+            return   # index_ready stays False; next Analyze triggers rebuild
+
+        self.embeddings  = emb
         self.image_paths = data["image_paths"]
         self.class_names = data["class_names"]
 
