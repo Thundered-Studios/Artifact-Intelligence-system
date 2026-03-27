@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Checkpoints & model weights (large binaries — commit only intentionally)
+checkpoints/*.pt
+checkpoints/*.pth
+*.pt
+*.pth
+*.npy
+
+# Data images (add your own; don't commit raw datasets to git)
+data/train/*/
+data/val/*/
+
+# IDE / OS artefacts
+.idea/
+.vscode/
+*.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
