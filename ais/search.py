@@ -1,15 +1,8 @@
 """
 ais/search.py
 -------------
-Builds and queries an in-memory embedding index for similarity search.
-No FAISS required — uses cosine similarity via PyTorch.
-
-Index file: checkpoints/ais_index.pt
-  {
-    "embeddings":   Tensor [N, embedding_dim],
-    "image_paths":  list[str],
-    "class_names":  list[str],
-  }
+Builds and queries an embedding index for similarity search.
+Uses pretrained ResNet18 — no prior training required.
 """
 
 from __future__ import annotations
@@ -17,51 +10,57 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
+import torch.nn as nn
+from torchvision import models
 from PIL import Image
 
 from ais.data.dataset import build_transforms
-from ais.models.embedding_net import EmbeddingNet
+
+INDEX_NAME = "ais_index.pt"
+
+
+def _build_backbone() -> tuple[nn.Module, int]:
+    """Load pretrained ResNet18, strip the classifier, return (model, feat_dim)."""
+    backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+    feat_dim = backbone.fc.in_features   # 512
+    backbone.fc = nn.Identity()
+    backbone.eval()
+    for p in backbone.parameters():
+        p.requires_grad = False
+    return backbone, feat_dim
 
 
 class ArtifactSearcher:
-    INDEX_NAME = "ais_index.pt"
-
-    def __init__(
-        self,
-        checkpoint: str | Path,
-        embedding_dim: int = 256,
-        num_classes: int | None = None,
-        index_dir: str | Path = "checkpoints",
-    ) -> None:
+    def __init__(self, index_dir: str | Path = "checkpoints") -> None:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.transform = build_transforms(image_size=224, is_train=False)
-        self.index_path = Path(index_dir) / self.INDEX_NAME
+        self.index_path = Path(index_dir) / INDEX_NAME
 
-        # ── Load model ────────────────────────────────────────────────────────
-        self.model = EmbeddingNet(
-            embedding_dim=embedding_dim,
-            num_classes=num_classes,
-            freeze_backbone=False,
-        )
-        state = torch.load(checkpoint, map_location=self.device)
-        self.model.load_state_dict(state)
-        self.model.to(self.device).eval()
+        self._backbone, self._feat_dim = _build_backbone()
+        self._backbone.to(self.device)
 
-        # ── Load index if it exists ───────────────────────────────────────────
-        self.embeddings: torch.Tensor | None = None
+        self.embeddings:  torch.Tensor | None = None
         self.image_paths: list[str] = []
         self.class_names: list[str] = []
 
         if self.index_path.exists():
             self._load_index()
 
-    # ── Index management ──────────────────────────────────────────────────────
+    # ── Embedding ─────────────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def _embed(self, image: Image.Image) -> torch.Tensor:
+        """Return [1, feat_dim] embedding for a PIL image."""
+        t = self.transform(image).unsqueeze(0).to(self.device)
+        return self._backbone(t).cpu()
+
+    # ── Index ─────────────────────────────────────────────────────────────────
 
     def build_index(self, data_dir: str | Path, on_progress=None) -> int:
         """
-        Walk `data_dir` (train + val), embed every image, save index.
-        Calls on_progress(current, total) if provided.
-        Returns the number of images indexed.
+        Walk data_dir (train + val), embed every image, save index.
+        on_progress(message) called with status strings.
+        Returns number of images indexed.
         """
         data_dir = Path(data_dir)
         extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
@@ -84,30 +83,27 @@ class ArtifactSearcher:
         embeddings, image_paths, class_names = [], [], []
         total = len(all_paths)
 
-        with torch.no_grad():
-            for i, img_path in enumerate(all_paths):
-                if on_progress:
-                    on_progress(i + 1, total)
-                try:
-                    img = Image.open(img_path).convert("RGB")
-                    tensor = self.transform(img).unsqueeze(0).to(self.device)
-                    z, _ = self.model(tensor)          # [1, embedding_dim]
-                    embeddings.append(z.cpu())
-                    image_paths.append(str(img_path))
-                    class_names.append(img_path.parent.name)
-                except Exception:
-                    continue
+        for i, img_path in enumerate(all_paths):
+            if on_progress:
+                on_progress(f"Indexing image {i + 1} of {total}...")
+            try:
+                img = Image.open(img_path).convert("RGB")
+                z = self._embed(img)
+                embeddings.append(z)
+                image_paths.append(str(img_path))
+                class_names.append(img_path.parent.name)
+            except Exception:
+                continue
 
-        self.embeddings = torch.cat(embeddings, dim=0)   # [N, embedding_dim]
+        self.embeddings  = torch.cat(embeddings, dim=0)
         self.image_paths = image_paths
         self.class_names = class_names
 
+        Path(self.index_path).parent.mkdir(parents=True, exist_ok=True)
         torch.save(
-            {
-                "embeddings":  self.embeddings,
-                "image_paths": self.image_paths,
-                "class_names": self.class_names,
-            },
+            {"embeddings": self.embeddings,
+             "image_paths": self.image_paths,
+             "class_names": self.class_names},
             self.index_path,
         )
         return len(image_paths)
@@ -124,47 +120,32 @@ class ArtifactSearcher:
 
     # ── Search ────────────────────────────────────────────────────────────────
 
-    def search(
-        self, image: Image.Image, top_k: int = 6
-    ) -> list[dict]:
+    def search(self, image: Image.Image, top_k: int = 6) -> list[dict]:
         """
-        Find the top_k most similar artifacts to `image`.
-
-        Returns list of dicts:
-            [{"path": str, "class": str, "score": float}, ...]
-        sorted by descending similarity.
+        Return top_k most similar artifacts.
+        Each result: {"path": str, "class": str, "score": float}
         """
         if not self.index_ready:
-            raise RuntimeError("Index not built. Call build_index() first.")
+            raise RuntimeError("Index not built yet.")
 
-        with torch.no_grad():
-            tensor = self.transform(image).unsqueeze(0).to(self.device)
-            z, logits = self.model(tensor)             # [1, embedding_dim]
-
-        # Cosine similarity between query and every indexed embedding
-        q = torch.nn.functional.normalize(z.cpu(), dim=1)           # [1, D]
-        db = torch.nn.functional.normalize(self.embeddings, dim=1)  # [N, D]
-        sims = (db @ q.T).squeeze(1)                                 # [N]
+        z = self._embed(image)
+        q  = nn.functional.normalize(z, dim=1)
+        db = nn.functional.normalize(self.embeddings, dim=1)
+        sims = (db @ q.T).squeeze(1)
 
         top_k = min(top_k, len(sims))
         scores, indices = sims.topk(top_k)
 
-        # Predicted class from classifier head (if present)
-        predicted_class: str | None = None
-        if logits is not None:
-            predicted_idx = logits.argmax(dim=1).item()
-            # Map index back to class name via the index's unique classes
-            unique_classes = sorted(set(self.class_names))
-            if predicted_idx < len(unique_classes):
-                predicted_class = unique_classes[predicted_idx]
+        # Majority-vote class from top results
+        top_classes = [self.class_names[i] for i in indices.tolist()]
+        predicted = max(set(top_classes), key=top_classes.count)
 
-        results = []
-        for score, idx in zip(scores.tolist(), indices.tolist()):
-            results.append({
+        return [
+            {
                 "path":      self.image_paths[idx],
                 "class":     self.class_names[idx],
                 "score":     score,
-                "predicted": predicted_class,
-            })
-
-        return results
+                "predicted": predicted,
+            }
+            for score, idx in zip(scores.tolist(), indices.tolist())
+        ]

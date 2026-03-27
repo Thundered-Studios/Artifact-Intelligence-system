@@ -2,7 +2,10 @@
 app.py
 ------
 AIS — Artifact Intelligence System
-GUI for archaeologists: upload a photo, find similar artifacts.
+Upload an artifact photo, click Analyze, see similar artifacts.
+
+First run: automatically downloads reference images and builds an index.
+Subsequent runs: results in under a second.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 
 import config
+from ais.data.scraper import scrape_dataset
 from ais.search import ArtifactSearcher
 
 WIN_W, WIN_H = 960, 640
@@ -48,34 +52,31 @@ class AISApp(tk.Tk):
         self._preview_ref: ImageTk.PhotoImage | None = None
 
         self._build_ui()
-        self._load_model_async()
+        self._load_searcher_async()
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
-        # ── Menu bar ──────────────────────────────────────────────────────────
         menubar = tk.Menu(self)
-        tools_menu = tk.Menu(menubar, tearoff=0)
-        tools_menu.add_command(label="Build / Rebuild Index", command=self._build_index)
-        menubar.add_cascade(label="Tools", menu=tools_menu)
+        tools = tk.Menu(menubar, tearoff=0)
+        tools.add_command(label="Rebuild Reference Database", command=self._confirm_rebuild)
+        menubar.add_cascade(label="Tools", menu=tools)
         self.configure(menu=menubar)
 
-        # ── Main area ─────────────────────────────────────────────────────────
         main = tk.Frame(self)
         main.pack(fill="both", expand=True, padx=10, pady=8)
 
-        self._build_left_panel(main)
+        self._build_left(main)
         tk.Frame(main, width=1, bg="gray70").pack(side="left", fill="y", padx=8)
-        self._build_right_panel(main)
+        self._build_right(main)
 
-        # ── Status bar ────────────────────────────────────────────────────────
-        self._status_var = tk.StringVar(value="Loading model...")
+        self._status_var = tk.StringVar(value="Starting up...")
         tk.Label(
             self, textvariable=self._status_var,
             relief="sunken", anchor="w", bd=1,
         ).pack(fill="x", side="bottom", ipady=2)
 
-    def _build_left_panel(self, parent: tk.Frame) -> None:
+    def _build_left(self, parent: tk.Frame) -> None:
         left = tk.Frame(parent, width=290)
         left.pack(side="left", fill="y")
         left.pack_propagate(False)
@@ -86,27 +87,31 @@ class AISApp(tk.Tk):
             left,
             width=PREVIEW_SIZE, height=PREVIEW_SIZE,
             relief="sunken", bd=2,
-            text="(no image)",
+            text="(click to choose photo)",
+            fg="gray50",
             cursor="hand2",
+            wraplength=200,
         )
         self._preview_label.pack()
         self._preview_label.bind("<Button-1>", lambda _: self._upload())
 
         tk.Frame(left, height=8).pack()
         tk.Button(left, text="Choose Photo...", command=self._upload, width=20).pack()
-        tk.Frame(left, height=4).pack()
-        self._search_btn = tk.Button(
-            left, text="Search", command=self._search, width=20, state="disabled"
-        )
-        self._search_btn.pack()
+        tk.Frame(left, height=6).pack()
 
-    def _build_right_panel(self, parent: tk.Frame) -> None:
+        self._analyze_btn = tk.Button(
+            left, text="Analyze", command=self._analyze,
+            width=20, state="disabled",
+        )
+        self._analyze_btn.pack()
+
+    def _build_right(self, parent: tk.Frame) -> None:
         right = tk.Frame(parent)
         right.pack(side="left", fill="both", expand=True)
 
         self._prediction_var = tk.StringVar()
         self._prediction_label = tk.Label(
-            right, textvariable=self._prediction_var, anchor="w"
+            right, textvariable=self._prediction_var, anchor="w",
         )
         # packed after first search
 
@@ -123,35 +128,28 @@ class AISApp(tk.Tk):
             w.destroy()
         tk.Label(
             self._results_frame,
-            text="Upload a photo and press Search.",
+            text="Upload a photo and click Analyze.",
             fg="gray50",
         ).place(relx=0.5, rely=0.4, anchor="center")
 
-    # ── Model loading ─────────────────────────────────────────────────────────
+    # ── Startup ───────────────────────────────────────────────────────────────
 
-    def _load_model_async(self) -> None:
-        threading.Thread(target=self._load_model, daemon=True).start()
+    def _load_searcher_async(self) -> None:
+        threading.Thread(target=self._load_searcher, daemon=True).start()
 
-    def _load_model(self) -> None:
-        ckpt = Path(config.CHECKPOINT_DIR) / config.CHECKPOINT_NAME
-        if not ckpt.exists():
-            self._set_status("No model found. Run train.py first.")
-            return
+    def _load_searcher(self) -> None:
+        """Load the searcher (pretrained model). No checkpoint needed."""
         try:
-            self._searcher = ArtifactSearcher(
-                checkpoint=ckpt,
-                embedding_dim=config.EMBEDDING_DIM,
-                num_classes=config.NUM_CLASSES,
-                index_dir=config.CHECKPOINT_DIR,
-            )
+            self._set_status("Loading model...")
+            self._searcher = ArtifactSearcher(index_dir=config.CHECKPOINT_DIR)
             if self._searcher.index_ready:
                 n = len(self._searcher.image_paths)
-                self._set_status(f"Ready — {n} artifacts indexed.")
-                self.after(0, self._enable_search)
+                self._set_status(f"Ready — {n} artifacts in reference database.")
             else:
-                self._set_status("Model loaded. Use Tools > Build Index before searching.")
+                self._set_status("Ready. Upload a photo and click Analyze.")
+            self.after(0, self._refresh_analyze_btn)
         except Exception as exc:
-            self._set_status(f"Error loading model: {exc}")
+            self._set_status(f"Startup error: {exc}")
 
     # ── Upload ────────────────────────────────────────────────────────────────
 
@@ -173,38 +171,69 @@ class AISApp(tk.Tk):
         self._preview_ref = ref
         self._preview_label.configure(image=ref, text="")
 
-        if self._searcher and self._searcher.index_ready:
-            self._enable_search()
-        self._set_status("Photo loaded. Press Search.")
+        self._refresh_analyze_btn()
+        self._set_status("Photo loaded. Click Analyze.")
 
-    # ── Search ────────────────────────────────────────────────────────────────
+    def _refresh_analyze_btn(self) -> None:
+        ready = self._uploaded_image is not None and self._searcher is not None
+        self._analyze_btn.configure(state="normal" if ready else "disabled")
 
-    def _enable_search(self) -> None:
-        self._search_btn.configure(state="normal")
+    # ── Analyze ───────────────────────────────────────────────────────────────
 
-    def _search(self) -> None:
-        if self._uploaded_image is None:
-            messagebox.showinfo("AIS", "Please upload a photo first.")
-            return
-        if self._searcher is None or not self._searcher.index_ready:
-            messagebox.showinfo("AIS", "Index not ready. Use Tools > Build Index.")
+    def _analyze(self) -> None:
+        if self._uploaded_image is None or self._searcher is None:
             return
 
-        self._search_btn.configure(state="disabled", text="Searching...")
-        self._set_status("Searching...")
+        self._analyze_btn.configure(state="disabled", text="Working...")
 
-        def _run():
-            try:
-                results = self._searcher.search(self._uploaded_image, top_k=TOP_K)
-                self.after(0, lambda: self._show_results(results))
-            except Exception as exc:
-                self.after(0, lambda: self._set_status(f"Search error: {exc}"))
-            finally:
-                self.after(0, lambda: self._search_btn.configure(
-                    state="normal", text="Search"
-                ))
+        if not self._searcher.index_ready:
+            # First run — need to scrape + index before searching
+            threading.Thread(target=self._first_run_then_search, daemon=True).start()
+        else:
+            threading.Thread(target=self._run_search, daemon=True).start()
 
-        threading.Thread(target=_run, daemon=True).start()
+    def _first_run_then_search(self) -> None:
+        """Scrape reference images, build index, then search. Runs once."""
+        try:
+            data_dir = Path(config.DATA_DIR)
+
+            # ── Step 1: scrape ────────────────────────────────────────────────
+            self._set_status("First run: downloading reference images (this takes ~30 seconds)...")
+            scrape_dataset(
+                classes=config.QUICK_CLASSES,
+                out_dir=data_dir,
+                n_images=config.QUICK_N_IMAGES,
+                val_split=0.2,
+                on_progress=self._set_status,
+            )
+
+            # ── Step 2: index ─────────────────────────────────────────────────
+            self._set_status("Building search index...")
+            n = self._searcher.build_index(data_dir, on_progress=self._set_status)
+            self._set_status(f"Index built — {n} reference artifacts.")
+
+            # ── Step 3: search ────────────────────────────────────────────────
+            self._run_search()
+
+        except Exception as exc:
+            self._set_status(f"Setup failed: {exc}")
+            self.after(0, lambda: self._analyze_btn.configure(
+                state="normal", text="Analyze"
+            ))
+
+    def _run_search(self) -> None:
+        try:
+            self._set_status("Analyzing...")
+            results = self._searcher.search(self._uploaded_image, top_k=TOP_K)
+            self.after(0, lambda: self._show_results(results))
+        except Exception as exc:
+            self._set_status(f"Analysis failed: {exc}")
+        finally:
+            self.after(0, lambda: self._analyze_btn.configure(
+                state="normal", text="Analyze"
+            ))
+
+    # ── Results ───────────────────────────────────────────────────────────────
 
     def _show_results(self, results: list[dict]) -> None:
         for w in self._results_frame.winfo_children():
@@ -215,7 +244,7 @@ class AISApp(tk.Tk):
             tk.Label(self._results_frame, text="No results found.").pack()
             return
 
-        top_class = results[0]["predicted"] or results[0]["class"]
+        top_class = results[0]["predicted"]
         self._prediction_var.set(f"Most likely: {top_class.replace('_', ' ').title()}")
         self._prediction_label.pack(fill="x", pady=(0, 6))
 
@@ -239,57 +268,26 @@ class AISApp(tk.Tk):
             tk.Label(cell, text=f"{int(res['score'] * 100)}% match", fg="gray50").pack()
 
         self._set_status(
-            f"Found {len(results)} similar artifacts. "
-            f"Best match: {top_class.replace('_', ' ').title()}"
+            f"Done — most likely {top_class.replace('_', ' ').title()}. "
+            f"{len(results)} similar artifacts shown."
         )
 
-    # ── Index building ────────────────────────────────────────────────────────
+    # ── Rebuild ───────────────────────────────────────────────────────────────
 
-    def _build_index(self) -> None:
-        if self._searcher is None:
-            messagebox.showinfo("AIS", "Model not loaded yet.")
-            return
-
-        data_dir = Path(config.DATA_DIR)
-        if not data_dir.exists():
-            messagebox.showerror(
-                "AIS",
-                f"Data directory '{data_dir}' not found.\n"
-                "Run scrape.py first.",
-            )
-            return
-
-        self._set_status("Building index...")
-
-        progress_var = tk.StringVar(value="")
-        prog_win = tk.Toplevel(self)
-        prog_win.title("Building Index")
-        prog_win.geometry("320x100")
-        prog_win.resizable(False, False)
-        prog_win.grab_set()
-
-        tk.Label(prog_win, text="Indexing artifact images...").pack(pady=(14, 4))
-        bar = ttk.Progressbar(prog_win, length=260, mode="determinate")
-        bar.pack()
-        tk.Label(prog_win, textvariable=progress_var, fg="gray50").pack(pady=4)
-
-        def _on_progress(current, total):
-            pct = int(current / total * 100)
-            self.after(0, lambda: bar.configure(value=pct))
-            self.after(0, lambda: progress_var.set(f"{current} / {total}"))
-
-        def _run():
-            try:
-                n = self._searcher.build_index(data_dir, on_progress=_on_progress)
-                self.after(0, prog_win.destroy)
-                self.after(0, lambda: self._set_status(f"Index built — {n} artifacts ready."))
-                self.after(0, self._enable_search)
-            except Exception as exc:
-                self.after(0, prog_win.destroy)
-                self.after(0, lambda: messagebox.showerror("AIS", str(exc)))
-                self.after(0, lambda: self._set_status("Index build failed."))
-
-        threading.Thread(target=_run, daemon=True).start()
+    def _confirm_rebuild(self) -> None:
+        if messagebox.askyesno(
+            "Rebuild Reference Database",
+            "This will re-download all reference images and rebuild the index.\n"
+            "Continue?",
+        ):
+            if self._searcher:
+                # Clear the index so next Analyze triggers a full rebuild
+                if self._searcher.index_path.exists():
+                    self._searcher.index_path.unlink()
+                self._searcher.embeddings  = None
+                self._searcher.image_paths = []
+                self._searcher.class_names = []
+            self._set_status("Index cleared. Click Analyze to rebuild.")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

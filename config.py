@@ -20,3 +20,14 @@ LEARNING_RATE = 1e-3
 # ── Checkpoints ───────────────────────────────────────────────────────────────
 CHECKPOINT_DIR = "checkpoints"
 CHECKPOINT_NAME = "ais_embedding_net.pt"
+
+# ── Quick setup (first-time Analyze) ──────────────────────────────────────────
+# Images scraped per class on first run. Small = fast setup (~20-30 seconds).
+QUICK_N_IMAGES = 15
+QUICK_CLASSES = {
+    "pottery":   "ancient pottery ceramic",
+    "coins":     "ancient coins numismatic",
+    "weapons":   "ancient weapons bronze",
+    "jewelry":   "ancient jewelry ornament",
+    "sculpture": "ancient sculpture figurine",
+}

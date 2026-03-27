@@ -22,9 +22,9 @@ Output layout
 
 from __future__ import annotations
 
-import time
 import random
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -36,9 +36,7 @@ logger = logging.getLogger(__name__)
 _SEARCH_URL = "https://collectionapi.metmuseum.org/public/collection/v1/search"
 _OBJECT_URL = "https://collectionapi.metmuseum.org/public/collection/v1/objects/{}"
 
-# Be polite to the API — wait between requests
-_REQUEST_DELAY = 0.3   # seconds between object-detail calls
-_DOWNLOAD_DELAY = 0.1  # seconds between image downloads
+_CONCURRENT_WORKERS = 8   # parallel threads for URL resolution + image download
 
 
 def _search_object_ids(query: str, max_results: int = 500) -> list[int]:
@@ -89,78 +87,74 @@ def scrape_class(
     n_images: int = 100,
     val_split: float = 0.2,
     seed: int = 42,
+    on_progress=None,
 ) -> dict[str, int]:
     """
-    Search the Met API for `query`, download up to `n_images` images,
-    and split them into train/val folders under `out_dir/<split>/<class_name>/`.
+    Search the Met API for `query`, download up to `n_images` images
+    concurrently, and split into train/val folders.
 
-    Parameters
-    ----------
-    query      : search term sent to the Met API (e.g. "ancient pottery")
-    class_name : folder name used as the class label (e.g. "pottery")
-    out_dir    : root output directory (e.g. Path("data"))
-    n_images   : how many images to download for this class
-    val_split  : fraction held out for validation (0–1)
-    seed       : random seed for reproducible train/val split
-
-    Returns
-    -------
-    {"train": n_train, "val": n_val}  — counts of successfully saved images
+    on_progress(message: str) is called with status updates when provided.
     """
     train_dir = out_dir / "train" / class_name
     val_dir   = out_dir / "val"   / class_name
     train_dir.mkdir(parents=True, exist_ok=True)
     val_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Searching Met API for '%s'…", query)
-    object_ids = _search_object_ids(query, max_results=n_images * 5)
+    if on_progress:
+        on_progress(f"Searching for {class_name}...")
 
+    object_ids = _search_object_ids(query, max_results=n_images * 4)
     if not object_ids:
         logger.warning("No results for query '%s'. Skipping.", query)
         return {"train": 0, "val": 0}
 
-    # Shuffle for variety; reproducible with seed
     rng = random.Random(seed)
     rng.shuffle(object_ids)
+    candidates = object_ids[: n_images * 3]   # fetch 3× to account for misses
 
-    # Collect image URLs (up to n_images usable ones)
+    # ── Resolve image URLs concurrently ───────────────────────────────────────
+    if on_progress:
+        on_progress(f"Resolving {class_name} image URLs...")
+
     usable: list[tuple[int, str]] = []
-    for oid in tqdm(object_ids, desc=f"  Resolving '{class_name}' URLs", leave=False):
-        if len(usable) >= n_images:
-            break
-        time.sleep(_REQUEST_DELAY)
-        url = _fetch_primary_image_url(oid)
-        if url:
-            usable.append((oid, url))
+    with ThreadPoolExecutor(max_workers=_CONCURRENT_WORKERS) as pool:
+        futures = {pool.submit(_fetch_primary_image_url, oid): oid for oid in candidates}
+        for future in as_completed(futures):
+            if len(usable) >= n_images:
+                break
+            oid = futures[future]
+            url = future.result()
+            if url:
+                usable.append((oid, url))
 
+    usable = usable[:n_images]
     if not usable:
-        logger.warning("No downloadable images found for '%s'.", query)
         return {"train": 0, "val": 0}
 
-    # Train / val split
+    # ── Train / val split ─────────────────────────────────────────────────────
     n_val   = max(1, int(len(usable) * val_split))
     val_set = set(oid for oid, _ in usable[:n_val])
 
+    # ── Download images concurrently ──────────────────────────────────────────
+    if on_progress:
+        on_progress(f"Downloading {class_name} images...")
+
     counts = {"train": 0, "val": 0}
-    for oid, url in tqdm(usable, desc=f"  Downloading '{class_name}'"):
+
+    def _fetch_one(item):
+        oid, url = item
         split    = "val" if oid in val_set else "train"
         dest_dir = val_dir if split == "val" else train_dir
         dest     = dest_dir / f"{oid}.jpg"
+        if dest.exists():
+            return split
+        return split if _download_image(url, dest) else None
 
-        if dest.exists():           # skip already-downloaded files
-            counts[split] += 1
-            continue
+    with ThreadPoolExecutor(max_workers=_CONCURRENT_WORKERS) as pool:
+        for result in pool.map(_fetch_one, usable):
+            if result:
+                counts[result] += 1
 
-        time.sleep(_DOWNLOAD_DELAY)
-        if _download_image(url, dest):
-            counts[split] += 1
-        else:
-            logger.debug("Skipped object %s (download error).", oid)
-
-    logger.info(
-        "  '%s' done — train: %d  val: %d",
-        class_name, counts["train"], counts["val"],
-    )
     return counts
 
 
@@ -170,24 +164,17 @@ def scrape_dataset(
     n_images: int = 100,
     val_split: float = 0.2,
     seed: int = 42,
-) -> None:
+    on_progress=None,
+) -> int:
     """
     Scrape multiple artifact classes in sequence.
-
-    Parameters
-    ----------
-    classes   : mapping of {class_name: search_query}
-                e.g. {"pottery": "ancient pottery", "coins": "ancient coins"}
-    out_dir   : root data directory (default "data")
-    n_images  : images to download per class
-    val_split : fraction held out for validation
-    seed      : RNG seed
+    Returns total number of images downloaded.
+    on_progress(message: str) called with status updates.
     """
     out_dir = Path(out_dir)
-    total = {"train": 0, "val": 0}
+    total = 0
 
     for class_name, query in classes.items():
-        print(f"\n[{class_name}] query='{query}'")
         counts = scrape_class(
             query=query,
             class_name=class_name,
@@ -195,11 +182,8 @@ def scrape_dataset(
             n_images=n_images,
             val_split=val_split,
             seed=seed,
+            on_progress=on_progress,
         )
-        total["train"] += counts["train"]
-        total["val"]   += counts["val"]
+        total += counts["train"] + counts["val"]
 
-    print(
-        f"\nDataset ready in '{out_dir}' — "
-        f"train: {total['train']} images  val: {total['val']} images"
-    )
+    return total
