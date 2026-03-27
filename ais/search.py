@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from pathlib import Path
+from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -344,3 +345,113 @@ class ArtifactSearcher:
             for score, idx in zip(scores.tolist(), indices.tolist())
         ]
         return results, z
+
+    # ── Firebase cloud sync ───────────────────────────────────────────────────
+
+    def pull_from_cloud(
+        self,
+        version: str,
+        classes: list[str],
+        cache_dir: Path,
+        on_progress: Callable | None = None,
+    ) -> int:
+        """
+        Download pre-computed embeddings + metadata from Firebase Storage
+        and merge into the local index.  Much faster than re-scraping.
+
+        Returns number of cloud artifacts added to the index.
+        """
+        from ais.firebase_client import get_client
+        client = get_client()
+        if client is None:
+            return 0
+
+        all_embeddings, all_paths, all_classes = [], [], []
+
+        for cls in classes:
+            emb = client.download_class_embeddings(cls, version, on_progress)
+            if emb is None:
+                continue
+            meta = client.download_class_metadata(cls, version)
+
+            # Resolve local image paths — download missing ones
+            for i, m in enumerate(meta):
+                local_path = cache_dir / "cloud" / cls / Path(m.get("storage_path", "")).name
+                if not local_path.exists() and m.get("storage_path"):
+                    client.download_image(m["storage_path"], local_path)
+                # Fallback to original URL string as path if local unavailable
+                path_str = str(local_path) if local_path.exists() else m.get("image_url", "")
+                all_paths.append(path_str)
+                all_classes.append(cls)
+
+            if emb.shape[0] > 0:
+                all_embeddings.append(emb)
+
+        if not all_embeddings:
+            return 0
+
+        cloud_emb = torch.cat(all_embeddings, dim=0)    # [N_cloud, D]
+
+        if self.embeddings is not None:
+            # Merge with existing local index
+            self.embeddings  = torch.cat([self.embeddings, cloud_emb], dim=0)
+            self.image_paths = self.image_paths + all_paths
+            self.class_names = self.class_names + all_classes
+        else:
+            self.embeddings  = cloud_emb
+            self.image_paths = all_paths
+            self.class_names = all_classes
+
+        # Persist merged index
+        torch.save(
+            {"embeddings": self.embeddings,
+             "image_paths": self.image_paths,
+             "class_names": self.class_names},
+            self.index_path,
+        )
+        return len(all_paths)
+
+    def push_to_cloud(
+        self,
+        data_dir: Path,
+        version: str,
+        on_progress: Callable | None = None,
+    ) -> bool:
+        """
+        Upload local embeddings + image paths to Firebase Storage so other
+        users benefit from locally scraped artifacts.
+        """
+        from ais.firebase_client import get_client
+        client = get_client()
+        if client is None or not self.index_ready:
+            return False
+
+        # Group by class
+        from collections import defaultdict as dd
+        class_embs: dict  = dd(list)
+        class_meta: dict  = dd(list)
+
+        for i, (path, cls) in enumerate(zip(self.image_paths, self.class_names)):
+            class_embs[cls].append(self.embeddings[i])
+            class_meta[cls].append({"storage_path": f"images/{cls}/{Path(path).name}",
+                                    "image_url":    path,
+                                    "source":       "met_museum"})
+
+        counts: dict[str, int] = {}
+        for cls, emb_list in class_embs.items():
+            emb_tensor = torch.stack(emb_list)
+            # Upload local images first
+            for m in class_meta[cls]:
+                local = Path(m["image_url"])
+                if local.exists():
+                    sp = client.upload_image(local, cls)
+                    if sp:
+                        m["storage_path"] = sp
+            ok = client.upload_class_embeddings(
+                cls, emb_tensor, class_meta[cls], version, on_progress
+            )
+            if ok:
+                counts[cls] = len(emb_list)
+
+        client.update_version(version, counts)
+        return True

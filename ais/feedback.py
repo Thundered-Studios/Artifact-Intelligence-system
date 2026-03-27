@@ -48,9 +48,11 @@ class FeedbackStore:
         """
         Record that the model predicted `predicted` but the correct class
         is `correct`. `embedding` is the [1, D] query embedding.
+        Also syncs to Firebase if configured.
         """
+        emb_list = embedding.squeeze(0).tolist()
         self._corrections.append({
-            "embedding": embedding.squeeze(0).tolist(),
+            "embedding": emb_list,
             "predicted": predicted,
             "correct":   correct,
         })
@@ -59,6 +61,20 @@ class FeedbackStore:
             "Correction saved: predicted=%s correct=%s (total=%d)",
             predicted, correct, len(self._corrections),
         )
+
+        # Sync to Firebase in background — community corrections improve shared model
+        try:
+            from ais.firebase_client import get_client
+            client = get_client()
+            if client:
+                import threading
+                threading.Thread(
+                    target=client.upload_correction,
+                    args=(predicted, correct, emb_list),
+                    daemon=True,
+                ).start()
+        except Exception:
+            pass   # Firebase optional — never block the UI
 
     def __len__(self) -> int:
         return len(self._corrections)

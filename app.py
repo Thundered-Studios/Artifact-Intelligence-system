@@ -201,6 +201,27 @@ class AISApp(tk.Tk):
                 embedding_dim=config.EMBEDDING_DIM,
                 index_dir=config.CHECKPOINT_DIR,
             )
+
+            # Try pulling latest embeddings from Firebase cloud database
+            from ais.firebase_client import get_client
+            client = get_client()
+            if client and client.connected:
+                self._set_status("Connected to cloud database — syncing...")
+                version = client.get_current_version() or "v1"
+                counts  = client.get_artifact_counts()
+                total_cloud = sum(counts.values())
+                if total_cloud > 0:
+                    added = self._searcher.pull_from_cloud(
+                        version=version,
+                        classes=list(counts.keys()),
+                        cache_dir=Path(config.DATA_DIR),
+                        on_progress=self._set_status,
+                    )
+                    if added:
+                        self._set_status(
+                            f"Cloud sync: +{added} artifacts from shared database."
+                        )
+
             if self._searcher.index_ready:
                 n = len(self._searcher.image_paths)
                 self._set_status(f"Ready — {n} artifacts in reference database.")
@@ -263,6 +284,18 @@ class AISApp(tk.Tk):
             self._set_status("Building search index...")
             n = self._searcher.build_index(data_dir, on_progress=self._set_status)
             self._set_status(f"Index built — {n} reference artifacts.")
+
+            # Push to cloud so other users benefit from this scrape
+            from ais.firebase_client import get_client
+            client = get_client()
+            if client and client.connected:
+                self._set_status("Uploading artifacts to cloud database...")
+                self._searcher.push_to_cloud(
+                    data_dir=data_dir,
+                    version="v1",
+                    on_progress=self._set_status,
+                )
+
             self._run_search()
         except Exception as exc:
             self._set_status(f"Setup failed: {exc}")

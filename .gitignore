@@ -30,5 +30,10 @@ data/val/*/
 *.DS_Store
 Thumbs.db
 
+# Firebase credentials — NEVER commit this
+firebase-credentials.json
+*-credentials.json
+serviceAccountKey.json
+
 # Jupyter
 .ipynb_checkpoints/
