@@ -20,15 +20,6 @@ LEARNING_RATE = 3e-4        # AdamW with cosine annealing
 CHECKPOINT_DIR  = "checkpoints"
 CHECKPOINT_NAME = "ais_embedding_net.pt"   # kept for CLI train.py compatibility
 
-# ── Firebase — shared cloud database ─────────────────────────────────────────
-# Set FIREBASE_ENABLED = True and fill in the two values below after:
-#   1. Creating a Firebase project at https://console.firebase.google.com
-#   2. Enabling Firestore + Storage
-#   3. Creating a Service Account → downloading the JSON key
-FIREBASE_ENABLED     = False
-FIREBASE_CREDENTIALS = "firebase-credentials.json"   # path to downloaded JSON key
-FIREBASE_BUCKET      = ""                             # e.g. "your-project.appspot.com"
-
 # ── Quick setup — first-time Analyze ─────────────────────────────────────────
 # 100 images per class × 12 classes = 1,200 reference artifacts
 # Concurrent downloads take ~2 minutes total.

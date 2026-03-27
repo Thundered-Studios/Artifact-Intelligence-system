@@ -62,19 +62,6 @@ class FeedbackStore:
             predicted, correct, len(self._corrections),
         )
 
-        # Sync to Firebase in background — community corrections improve shared model
-        try:
-            from ais.firebase_client import get_client
-            client = get_client()
-            if client:
-                import threading
-                threading.Thread(
-                    target=client.upload_correction,
-                    args=(predicted, correct, emb_list),
-                    daemon=True,
-                ).start()
-        except Exception:
-            pass   # Firebase optional — never block the UI
 
     def __len__(self) -> int:
         return len(self._corrections)
