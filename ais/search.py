@@ -55,6 +55,7 @@ class ArtifactSearcher:
         self.embeddings:  torch.Tensor | None = None
         self.image_paths: list[str] = []
         self.class_names: list[str] = []
+        self._trained: bool = False   # True only after domain adaptation has been trained
 
         # Load existing model + index if available
         self._try_load()
@@ -74,6 +75,7 @@ class ArtifactSearcher:
             try:
                 state = torch.load(self.model_path, map_location=self.device)
                 self.model.load_state_dict(state["model"])
+                self._trained = True
                 logger.info("Loaded trained ArtifactNet from '%s'.", self.model_path)
             except Exception as exc:
                 logger.warning("Could not load model weights: %s", exc)
@@ -162,6 +164,7 @@ class ArtifactSearcher:
                 on_progress(f"Training epoch {epoch}/{epochs} — loss: {avg:.4f}")
 
         self.model.eval()
+        self._trained = True
 
         # Save trained model
         self.index_dir.mkdir(parents=True, exist_ok=True)
@@ -176,15 +179,22 @@ class ArtifactSearcher:
     def _embed(self, image: Image.Image) -> torch.Tensor:
         """
         Embed a single PIL image using 5-crop Test-Time Augmentation.
-        Returns [1, embedding_dim] — average of 5 augmented views.
+        Returns [1, embedding_dim] — L2-normalised average of 5 augmented views.
         """
         crops = []
         for tfm in self._tta_transforms:
             t = tfm(image).unsqueeze(0).to(self.device)
-            z, _ = self.model(t)
-            crops.append(z)
-        avg = torch.stack(crops, dim=0).mean(dim=0)   # [1, D]
-        return F.normalize(avg, dim=1).cpu()
+            if self._trained:
+                z, _ = self.model(t)
+            else:
+                # No trained model yet — use raw DINOv2 CLS token directly.
+                # Zero-shot DINOv2 is more accurate than a barely-trained adapter.
+                dino_out = self.model.backbone.forward_features(t)
+                z = dino_out["x_norm_clstoken"]          # [1, 768]
+                z = F.normalize(z, dim=1)
+            crops.append(z.cpu())
+        avg = torch.stack(crops, dim=0).mean(dim=0)     # [1, D]
+        return F.normalize(avg, dim=1)
 
     # ── Index ─────────────────────────────────────────────────────────────────
 

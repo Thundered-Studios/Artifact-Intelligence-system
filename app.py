@@ -60,6 +60,8 @@ class AISApp(tk.Tk):
         menubar = tk.Menu(self)
         tools = tk.Menu(menubar, tearoff=0)
         tools.add_command(label="Rebuild Reference Database", command=self._confirm_rebuild)
+        tools.add_separator()
+        tools.add_command(label="Refine Model (trains on current data)", command=self._refine_model)
         menubar.add_cascade(label="Tools", menu=tools)
         self.configure(menu=menubar)
 
@@ -109,14 +111,14 @@ class AISApp(tk.Tk):
         right = tk.Frame(parent)
         right.pack(side="left", fill="both", expand=True)
 
+        tk.Label(right, text="Similar Artifacts", anchor="w").pack(fill="x")
+        tk.Frame(right, height=1, bg="gray70").pack(fill="x", pady=(2, 4))
+
         self._prediction_var = tk.StringVar()
         self._prediction_label = tk.Label(
             right, textvariable=self._prediction_var, anchor="w",
         )
-        # packed after first search
-
-        tk.Label(right, text="Similar Artifacts", anchor="w").pack(fill="x")
-        tk.Frame(right, height=1, bg="gray70").pack(fill="x", pady=(2, 6))
+        self._prediction_label.pack(fill="x", pady=(0, 4))
 
         self._results_frame = tk.Frame(right)
         self._results_frame.pack(fill="both", expand=True)
@@ -196,7 +198,7 @@ class AISApp(tk.Tk):
             threading.Thread(target=self._run_search, daemon=True).start()
 
     def _first_run_then_search(self) -> None:
-        """Scrape → train → index → search. Runs once on first Analyze."""
+        """Scrape → index → search on first Analyze (no training — DINOv2 zero-shot is better with small data)."""
         try:
             data_dir = Path(config.DATA_DIR)
 
@@ -210,22 +212,12 @@ class AISApp(tk.Tk):
                 on_progress=self._set_status,
             )
 
-            # ── Step 2: train domain adaptation layers ────────────────────────
-            self._set_status("Training your personal artifact model...")
-            self._searcher.train(
-                data_dir=data_dir,
-                epochs=config.EPOCHS,
-                batch_size=config.BATCH_SIZE,
-                lr=config.LEARNING_RATE,
-                on_progress=self._set_status,
-            )
-
-            # ── Step 3: index ─────────────────────────────────────────────────
+            # ── Step 2: index with raw DINOv2 features ────────────────────────
             self._set_status("Building search index...")
             n = self._searcher.build_index(data_dir, on_progress=self._set_status)
             self._set_status(f"Index built — {n} reference artifacts.")
 
-            # ── Step 4: search ────────────────────────────────────────────────
+            # ── Step 3: search ────────────────────────────────────────────────
             self._run_search()
 
         except Exception as exc:
@@ -262,7 +254,6 @@ class AISApp(tk.Tk):
         self._prediction_var.set(
             f"Most likely: {top_class.replace('_', ' ').title()}    ({confidence})"
         )
-        self._prediction_label.pack(fill="x", pady=(0, 6))
 
         grid = tk.Frame(self._results_frame)
         grid.pack(fill="both", expand=True)
@@ -281,7 +272,8 @@ class AISApp(tk.Tk):
 
             tk.Label(cell, image=ref).pack()
             tk.Label(cell, text=res["class"].replace("_", " ").title()).pack()
-            tk.Label(cell, text=f"{int(res['score'] * 100)}% match", fg="gray50").pack()
+            pct = max(0, int(res["score"] * 100))
+            tk.Label(cell, text=f"{pct}% match", fg="gray50").pack()
 
         self._set_status(
             f"Done — most likely {top_class.replace('_', ' ').title()}. "
@@ -304,6 +296,41 @@ class AISApp(tk.Tk):
                 self._searcher.image_paths = []
                 self._searcher.class_names = []
             self._set_status("Index cleared. Click Analyze to rebuild.")
+
+    def _refine_model(self) -> None:
+        """Train domain adaptation layers on current data, then rebuild index."""
+        if self._searcher is None:
+            messagebox.showinfo("AIS", "Model not loaded yet.")
+            return
+        data_dir = Path(config.DATA_DIR)
+        if not (data_dir / "train").exists():
+            messagebox.showerror("AIS", "No training data found. Run Analyze first.")
+            return
+        if not messagebox.askyesno(
+            "Refine Model",
+            "This will train the model on your current reference images (~3 min on CPU).\n"
+            "Use this after collecting more artifact photos for better accuracy.\nContinue?",
+        ):
+            return
+
+        def _run():
+            try:
+                self._set_status("Refining model...")
+                self._searcher.train(
+                    data_dir=data_dir,
+                    epochs=config.EPOCHS,
+                    batch_size=config.BATCH_SIZE,
+                    lr=config.LEARNING_RATE,
+                    on_progress=self._set_status,
+                )
+                self._set_status("Rebuilding index with refined model...")
+                n = self._searcher.build_index(data_dir, on_progress=self._set_status)
+                self.after(0, self._enable_search)
+                self._set_status(f"Model refined — {n} artifacts re-indexed.")
+            except Exception as exc:
+                self._set_status(f"Refinement failed: {exc}")
+
+        threading.Thread(target=_run, daemon=True).start()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
